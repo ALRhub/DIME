@@ -1,6 +1,6 @@
 wandb:
   entity: tcx513887573
   group: DIME_${env_name}
-  project: DIME
+  project: DIME_test
   job_type: lr${alg.optimizer.lr_actor}
-  activate: True
+  activate: False
