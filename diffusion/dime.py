@@ -591,7 +591,7 @@ class DIME(OffPolicyAlgorithmJax):
 
 # Save and load model
 def save_model_state(train_state, path, name, n_steps):
-    # Serialize the model parameters
+    # Serialize the model parameters, 'hb/h1hand-run-v0'
     serialized_state = flax.serialization.to_bytes(train_state)
     os.makedirs(path, exist_ok=True)
     extended_path = os.path.join(path, f'{name}_{n_steps}.msgpack')

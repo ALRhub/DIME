@@ -8,7 +8,7 @@ import jax.numpy as jnp
 from gymnasium import spaces
 from functools import partial
 
-from diffusion.diffusion_policy import DiffPol
+from diffusion.MT_DiffPol import MT_DiffPol
 from flax.training.train_state import TrainState
 from stable_baselines3.common.noise import ActionNoise
 from diffusion.dime import DIME
@@ -17,16 +17,18 @@ from typing import Any, ClassVar, Dict, Optional, Tuple, Type, Union
 from stable_baselines3.common.type_aliases import GymEnv
 from common.buffers import MTReplayBuffer
 from common.normalizer import RewardNormalizer
+from models.critic import VectorCritic, MTVectorCriticConcat
+from hydra.utils import get_class
 
 
 class MTDIME(DIME):
-    policy_aliases: ClassVar[Dict[str, Type[DiffPol]]] = {  # type: ignore[assignment]
-        "MlpPolicy": DiffPol,
+    policy_aliases: ClassVar[Dict[str, Type[MT_DiffPol]]] = {  # type: ignore[assignment]
+        "MlpPolicy": MT_DiffPol,
         # Minimal dict support using flatten()
-        "MultiInputPolicy": DiffPol,
+        "MultiInputPolicy": MT_DiffPol,
     }
 
-    policy: DiffPol
+    policy: MT_DiffPol
     action_space: spaces.Box  # type: ignore[assignment]
 
     def __init__(self,
@@ -67,7 +69,8 @@ class MTDIME(DIME):
         )
         self.normalize_reward = cfg.alg.normalize_reward
         self.normalizer = RewardNormalizer(env.num_envs, self.target_entropy, discount=cfg.alg.gamma, v_max=cfg.alg.vmax) if self.normalize_reward else None
-
+        self.policy_cls = get_class(cfg.alg.policy_cls)
+        self.critic_cls = get_class(cfg.alg.critic._target_)
 
     def train(self, batch_size, gradient_steps):
         # Sample all at once for efficiency (so we can jit the for loop)
@@ -129,7 +132,9 @@ class MTDIME(DIME):
             self.cfg.alg.critic.v_min,
             self.cfg.alg.critic.v_max,
             self.cfg.alg.critic.entr_coeff,
-            self.cfg.alg.critic.n_atoms
+            self.cfg.alg.critic.n_atoms,
+            critic_cls=self.critic_cls,
+            policy_cls=self.policy_cls,
         )
         self._n_updates += gradient_steps
 
@@ -172,7 +177,9 @@ class MTDIME(DIME):
             v_min,
             v_max,
             entr_coeff,
-            num_atoms
+            num_atoms,
+            critic_cls,
+            policy_cls,
     ):
         actor_loss_value = jnp.array(0)
         actor_metrics = [{}]
@@ -201,6 +208,7 @@ class MTDIME(DIME):
                 slice(data.next_observations),
                 slice(data.rewards),
                 slice(data.dones),
+                slice(data.task_ids),
                 n_env_interacts,
                 num_atoms,
                 z_atoms,
@@ -208,9 +216,11 @@ class MTDIME(DIME):
                 v_max,
                 entr_coeff,
                 key,
-                target_sampler
+                target_sampler,
+                critic_cls,
+                policy_cls,
             )
-            qf_state = MTDIME.soft_update(tau, qf_state)
+            qf_state = cls.soft_update(tau, qf_state)
             target_actor_state = target_actor_state
             # hack to be able to jit (n_updates % policy_delay == 0)
             # a = False
@@ -225,11 +235,13 @@ class MTDIME(DIME):
                     z_atoms,
                     sampler,
                     q_reduce_fn,
+                    critic_cls,
+                    policy_cls,
                 )
-                ent_coef_state, _ = MTDIME.update_temperature(target_entropy, ent_coef_state,
+                ent_coef_state, _ = cls.update_temperature(target_entropy, ent_coef_state,
                                                               actor_metrics[0]['run_costs'])
 
-                target_actor_state = MTDIME.soft_update_target_actor(policy_tau, actor_state, target_actor_state)
+                target_actor_state = cls.soft_update_target_actor(policy_tau, actor_state, target_actor_state)
         log_metrics = {'actor_loss': actor_loss_value, **actor_metrics[0], **log_metrics_critic}
         return qf_state, actor_state, target_actor_state, ent_coef_state, key, log_metrics
 
@@ -275,3 +287,239 @@ class MTDIME(DIME):
             dones = self.replay_buffer.dones[self.replay_buffer.pos]
             self.normalizer.update(reward, dones)
         return r
+
+    @staticmethod
+    @partial(jax.jit, static_argnames=["crossq_style", "use_bnstats_from_live_net", "sampler", "num_atoms", "z_atoms",
+                                       "v_min", "v_max", "entr_coeff"])
+    def update_critic(
+            crossq_style: bool,
+            use_bnstats_from_live_net: bool,
+            gamma: float,
+            actor_state: TrainState,
+            qf_state: RLTrainState,
+            ent_coef_state: TrainState,
+            observations: np.ndarray,
+            actions: np.ndarray,
+            next_observations: np.ndarray,
+            rewards: np.ndarray,
+            dones: np.ndarray,
+            task_ids: np.ndarray,
+            n_env_interacts: int,
+            num_atoms: int,
+            z_atoms: jnp.ndarray,
+            v_min: int,
+            v_max: int,
+            entr_coeff: float,
+            key,
+            sampler,
+            critic_cls=MTVectorCriticConcat,
+            policy_cls=MT_DiffPol,
+    ):
+        key, noise_key, dropout_key_target, dropout_key_current, redq_key = jax.random.split(key, 5)
+        # sample action from the actor
+        task_embeddings = critic_cls.apply({"params":qf_state.params}, task_ids, method=policy_cls.get_task_embeddings)
+        out = policy_cls.sample_action(actor_state, actor_state.params, next_observations, noise_key, sampler, task_embeddings=task_embeddings)
+        all_actions, next_run_costs, next_sto_costs, next_terminal_costs, latents, v_t = out
+        next_state_actions = jax.lax.stop_gradient(all_actions)
+        next_run_costs = jax.lax.stop_gradient(next_run_costs)
+        next_sto_costs = jax.lax.stop_gradient(next_sto_costs)
+        next_terminal_costs = jax.lax.stop_gradient(next_terminal_costs)
+
+        ent_coef_value = ent_coef_state.apply_fn({"params": ent_coef_state.params}, n_env_interacts)
+
+        def ce_loss(params, batch_stats, dropout_key):
+            if not crossq_style:
+                next_q_values = qf_state.apply_fn(
+                    {
+                        "params": qf_state.target_params,
+                        "batch_stats": qf_state.target_batch_stats if not use_bnstats_from_live_net else batch_stats
+                    },
+                    next_observations, next_state_actions, task_ids,
+                    rngs={"dropout": dropout_key_target},
+                    train=False, task_ids=task_ids
+                )
+
+                # shape is (n_critics, batch_size, 1)
+                current_q_values, state_updates = qf_state.apply_fn(
+                    {"params": params, "batch_stats": batch_stats},
+                    observations, actions, task_ids,
+                    rngs={"dropout": dropout_key},
+                    mutable=["batch_stats"],
+                    train=True, task_ids=task_ids
+                )
+
+            else:
+                # ----- CrossQ's One Weird Trick™ -----
+                # concatenate current and next observations to double the batch size
+                # new shape of input is (n_critics, 2*batch_size, obs_dim + act_dim)
+                # apply critic to this bigger batch
+                catted_q_values, state_updates = qf_state.apply_fn(
+                    {"params": params, "batch_stats": batch_stats},
+                    jnp.concatenate([observations, next_observations], axis=0),
+                    jnp.concatenate([actions, next_state_actions], axis=0),
+                    task_ids,
+                    rngs={"dropout": dropout_key},
+                    mutable=["batch_stats"],
+                    train=True, task_ids=task_ids
+                )
+                current_q_values, next_q_values = jnp.split(catted_q_values, 2, axis=1)
+
+            if next_q_values.shape[0] > 2:  # only for REDQ
+                # REDQ style subsampling of critics.
+                m_critics = 2
+                next_q_values = jax.random.choice(redq_key, next_q_values, (m_critics,), replace=False, axis=0)
+
+            next_q_values_q1 = next_q_values[0]
+            next_q_values_q2 = next_q_values[1]
+
+            current_q1 = current_q_values[0]
+            current_q2 = current_q_values[1]
+
+            def projection(next_dist, rewards, dones, gamma, v_min, v_max, num_atoms, support):
+                delta_z = (v_max - v_min) / (num_atoms - 1)
+                batch_size = rewards.shape[0]
+
+                entr_bon = - (1 - dones[:, None]) * gamma * ent_coef_value * (
+                            next_run_costs + next_sto_costs + next_terminal_costs)
+
+                # Compute target_z
+                target_z = jnp.clip(rewards[:, None] + entr_bon + (1 - dones[:, None]) * gamma * support, a_min=v_min,
+                                    a_max=v_max)
+                b = (target_z - v_min) / delta_z
+                l = jnp.floor(b).astype(jnp.int32)
+                u = jnp.ceil(b).astype(jnp.int32)
+
+                # Adjust l and u to ensure they remain within valid bounds
+                l = jnp.where((u > 0) & (l == u), l - 1, l)
+                u = jnp.where((l < (num_atoms - 1)) & (l == u), u + 1, u)
+
+                # Create the projected distribution
+                proj_dist = jnp.zeros_like(next_dist)
+
+                # Offset calculation for batch indexing
+                offset = jnp.arange(batch_size)[:, None] * num_atoms
+                # offset = jnp.tile(offset, (1, num_atoms))  # Repeat along the second axis
+
+                # Index updates for proj_dist
+                l_idx = (l + offset).ravel()
+                u_idx = (u + offset).ravel()
+
+                # Flattened updates
+                l_update = (next_dist * (u.astype(jnp.float32) - b)).ravel()
+                u_update = (next_dist * (b - l.astype(jnp.float32))).ravel()
+
+                # Flatten proj_dist for updates
+                proj_dist_flat = proj_dist.ravel()
+
+                # Add values to proj_dist
+                proj_dist_flat = proj_dist_flat.at[l_idx].add(l_update)
+                proj_dist_flat = proj_dist_flat.at[u_idx].add(u_update)
+
+                # Reshape back to [batch_size, num_atoms]
+                proj_dist = proj_dist_flat.reshape(batch_size, num_atoms)
+
+                return proj_dist
+
+            target_q1_projected = projection(next_dist=next_q_values_q1, rewards=rewards, dones=dones, gamma=gamma,
+                                             v_min=v_min, v_max=v_max, num_atoms=num_atoms, support=z_atoms)
+            target_q2_projected = projection(next_dist=next_q_values_q2, rewards=rewards, dones=dones, gamma=gamma,
+                                             v_min=v_min, v_max=v_max, num_atoms=num_atoms, support=z_atoms)
+
+            next_q_values = jax.lax.stop_gradient(jnp.mean(
+                jnp.stack([target_q1_projected, target_q2_projected], axis=0), axis=0))
+
+            def binary_cross_entropy(pred, target):
+                return -jnp.mean(jnp.sum(target * jnp.log(pred + 1e-15), axis=-1)) + entr_coeff * jnp.mean(
+                    jnp.sum(pred * jnp.log(pred + 1e-15), axis=-1))  # + (1 - target) * jnp.log(1 - pred + 1e-15))
+
+            loss = binary_cross_entropy(current_q1, next_q_values) + binary_cross_entropy(current_q2, next_q_values)
+            qf_pi1 = jnp.sum(current_q1 * z_atoms, axis=-1)
+            qf_pi2 = jnp.sum(current_q2 * z_atoms, axis=-1)
+            entr_1 = -jnp.mean(jnp.sum(current_q1 * jnp.log(current_q1 + 1e-15), axis=-1))
+            entr_2 = -jnp.mean(jnp.sum(current_q2 * jnp.log(current_q2 + 1e-15), axis=-1))
+            min_qf_pi = jax.lax.stop_gradient(jnp.min(jnp.stack([qf_pi1, qf_pi2], axis=0), axis=0).squeeze())
+            return loss, (state_updates, min_qf_pi, next_q_values, entr_1, entr_2)
+
+        (qf_loss_value, (state_updates, current_q_values, next_q_values, entr_1, entr_2)), grads = \
+            jax.value_and_grad(ce_loss, has_aux=True)(qf_state.params, qf_state.batch_stats, dropout_key_current)
+
+        qf_state = qf_state.apply_gradients(grads=grads)
+        qf_state = qf_state.replace(batch_stats=state_updates["batch_stats"])
+
+        metrics = {
+            'critic_loss': qf_loss_value,
+            'ent_coef': ent_coef_value,
+            'current_q_values': current_q_values.mean(),
+            'next_q_values': next_q_values.mean(),
+            'entrQ_1': entr_1,
+            'entrQ_2': entr_2,
+        }
+        return qf_state, metrics, key
+
+    @staticmethod
+    @partial(jax.jit, static_argnames=["q_reduce_fn", "sampler"])
+    def update_actor(
+            actor_state: TrainState,
+            qf_state: RLTrainState,
+            ent_coef_state: TrainState,
+            observations: np.ndarray,
+            task_ids,
+            n_env_interacts: int,
+            key,
+            z_atoms: jnp.ndarray,
+            sampler,
+            q_reduce_fn,
+            critic_cls=MTVectorCriticConcat,
+            policy_cls=MT_DiffPol
+    ):
+        key, dropout_key, noise_key = jax.random.split(key, 3)
+
+        def actor_loss(actor_state_in, actor_params):
+            task_embeddings = critic_cls.apply({"params": qf_state.params}, task_ids,
+                                               method=MTVectorCriticConcat.get_task_embeddings)
+            out = policy_cls.sample_action(actor_state_in, actor_params, observations, noise_key, sampler, task_embeddings=task_embeddings)
+            actions, run_costs, sto_costs, terminal_costs, latents, v_t = out
+            qf_pi = qf_state.apply_fn(
+                {
+                    "params": qf_state.params,
+                    "batch_stats": qf_state.batch_stats
+                },
+                observations,
+                actions,
+                rngs={"dropout": dropout_key}, train=False, task_ids=task_ids
+            )
+
+            qf_pi1 = jnp.sum(qf_pi[0] * z_atoms, axis=-1)
+            qf_pi2 = jnp.sum(qf_pi[1] * z_atoms, axis=-1)
+            min_qf_pi = q_reduce_fn(jnp.stack([qf_pi1, qf_pi2], axis=0), axis=0).squeeze()
+            ent_coef_value = ent_coef_state.apply_fn({"params": ent_coef_state.params}, n_env_interacts)
+            actor_loss = (- min_qf_pi + ent_coef_value * (run_costs.squeeze() + sto_costs.squeeze() + terminal_costs.squeeze())).mean()
+
+            max_actions = jnp.max(jnp.max(latents, axis=0), axis=1)
+            min_actions = jnp.min(jnp.min(latents, axis=0), axis=1)
+            mean_actions = jnp.mean(jnp.mean(latents, axis=0), axis=1)
+
+            latent_acts = {'max_la': max_actions, 'min_la': min_actions, 'mean_la': mean_actions}
+
+            return actor_loss, (run_costs.mean(), sto_costs.mean(), terminal_costs.mean(), latent_acts)
+
+        outs = jax.value_and_grad(actor_loss, has_aux=True, argnums=1)(actor_state, actor_state.params)
+        (act_loss_value, (run_costs_mean, sto_costs, terminal_costs, latent_acts)), grads = outs
+        actor_state = actor_state.apply_gradients(grads=grads)
+        metrics = {"entropy": 0.0,
+                   "run_costs": run_costs_mean,
+                   "sto_costs": sto_costs,
+                   "terminal_costs": terminal_costs,
+        }
+        return actor_state, qf_state, act_loss_value, key, [metrics, latent_acts]
+
+    # noinspection PyMethodOverriding
+    def predict(
+        self,
+        observation: Union[np.ndarray, Dict[str, np.ndarray]],
+        task_ids,
+        state: Optional[Tuple[np.ndarray, ...]] = None,
+        episode_start: Optional[np.ndarray] = None,
+        deterministic: bool = False,
+    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
+        return self.policy.predict(observation,state, episode_start, deterministic, task_ids=task_ids)

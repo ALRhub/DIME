@@ -8,11 +8,21 @@ from dm_control.suite.ball_in_cup import catch
 from gymnasium import spaces
 # from envpool.mujoco.dmc.registration import task_name
 from gymnasium.wrappers import FlattenObservation, RescaleAction, TimeLimit
-from numpy.f2py.auxfuncs import throw_error
-from numpy.f2py.f90mod_rules import options
 from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common.vec_env.base_vec_env import VecEnvObs, VecEnvStepReturn, VecEnvIndices
-from toolz import excepts
+from stable_baselines3.common.vec_env import DummyVecEnv, VecVideoRecorder
+from stable_baselines3.common.utils import set_random_seed
+
+class MultitaskDummy(DummyVecEnv):
+    def __init__(self, env_fns, num_tasks):
+        super().__init__(env_fns)
+        self.num_tasks = num_tasks
+        assert not self.num_envs % self.num_tasks
+
+    # def step(self, actions: np.ndarray) -> VecEnvStepReturn:
+    #     obs, rewards, dones, infos = super().step(actions)
+    #     # obs = np.concatenate((obs, self.task_ids), axis=0)
+    #     return obs, rewards, dones, infos
 
 
 class FlattenObservationShadowhandWrapper(gym.ObservationWrapper):
@@ -45,6 +55,12 @@ def make_dummy_env(names, seed=0, repeat_envs=1):
     envs = DummyVecEnv([lambda: make_env(name, seed+i) for i,name in enumerate(names)])
     envs.reset()
     return envs
+
+def make_video_dummy_env(names,path, interval,record_trigger=None, seed=0, repeat_envs=1,):
+    env = make_dummy_env(names,seed,repeat_envs)
+    if not record_trigger:
+        record_trigger = lambda x: x % 2000
+    return VecVideoRecorder(env,path,record_trigger, interval)
 
 def _make_env_dmc(env_name: str, seed: int = 0, num_env=1) -> gym.Env:
     if num_env != 1:

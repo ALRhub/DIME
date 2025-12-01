@@ -1,0 +1,46 @@
+tau: 1.0
+policy_tau: 1.0
+utd: 2
+gamma: 0.99
+policy_delay: 3
+batch_size: 3
+buffer_size: 10
+learning_starts: 4
+reset_models: False
+vmax: 10
+normalize_reward: False
+policy_cls: diffusion.MT_DiffPol.MT_DiffPol
+
+ent_coef:
+  type: "auto" # const or auto
+  init: 1.0
+  target: 6.0
+
+critic:
+  _target_: models.critic.MTVectorCriticConcat
+  activation: 'relu'
+  n_critics: 2
+  hs: [2, 2]
+  dropout_rate: null # None in yaml
+  use_layer_norm: False
+  n_atoms: 101
+  v_min: -10
+  v_max: ${alg.vmax}
+  entr_coeff: 0.005
+
+optimizer:
+  bn: True
+  bn_momentum: 0.99
+  bn_mode: brn_actor
+  bn_warmup: 100000
+  lr_critic: 3.0e-4
+  lr_actor: 3.0e-4
+  b1: 0.5
+  do_actor_grad_clip: True
+  actor_grad_clip: 1.0
+
+
+actor:
+  diff_steps: 16
+
+

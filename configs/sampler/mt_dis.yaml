@@ -1,0 +1,15 @@
+# Time-Reversed Diffusion Sampler (DIS)
+_target_: diffusion.od.od_sampling.mt_sample_concat
+name: dis
+underdamped: False
+integrator: EM
+init_std: 2.5
+friction: 1.0
+learn_prior: False
+learn_betas: False
+learn_friction: True
+learn_mass_matrix: False
+
+defaults:
+  - score_model: cond_pisgradnet
+  - dt_schedule: cosine

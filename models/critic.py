@@ -16,6 +16,7 @@ import tensorflow_probability
 
 from common.policies import BaseJaxPolicy
 from common.type_aliases import ActorTrainState, RLTrainState
+from common.task_embedder import TaskEmbedding
 
 tfp = tensorflow_probability.substrates.jax
 tfd = tfp.distributions
@@ -266,4 +267,49 @@ class VectorCritic(nn.Module):
         )(obs, action, train)
         return q_values
 
+class MTVectorCriticConcat(nn.Module):
+    net_arch: Sequence[int]
+    activation_fn: Type[nn.Module]
+    n_tasks:int
+    batch_norm_momentum: float
+    bn_warmup: int = 100_000
+    use_batch_norm: bool = False
+    batch_norm_mode: str = "bn"
+    use_layer_norm: bool = False
+    dropout_rate: Optional[float] = None
+    n_critics: int = 2
+    n_atoms: int = 101
+    task_embed_dim:int = 32
 
+    def setup(self) -> None:
+        self.task_embedder = TaskEmbedding(self.n_tasks, self.task_embed_dim)
+        vmap_critic = nn.vmap(
+            Critic,
+            variable_axes={"params": 0, "batch_stats": 0},
+            split_rngs={"params": True, "dropout": True, "batch_stats": True},
+            in_axes=None,
+            out_axes=0,
+            axis_size=self.n_critics,
+        )
+        self.vmap_critic = vmap_critic(
+            use_layer_norm=self.use_layer_norm,
+            use_batch_norm=self.use_batch_norm,
+            batch_norm_momentum=self.batch_norm_momentum,
+            bn_warmup=self.bn_warmup,
+            bn_mode=self.batch_norm_mode,
+            dropout_rate=self.dropout_rate,
+            net_arch=self.net_arch,
+            activation_fn=self.activation_fn,
+            n_atoms=self.n_atoms
+        )
+
+    def __call__(self, obs: jnp.ndarray, action: jnp.ndarray, task_ids, train: bool = True):
+        # Idea taken from https://github.com/perrin-isir/xpag
+        # Similar to https://github.com/tinkoff-ai/CORL for PyTorch
+        task_embeds = self.task_embedder(task_ids)
+        obs = jnp.concat((obs,task_embeds), axis=1)
+        q_values = self.vmap_critic(obs, action, train)
+        return q_values
+
+    def get_task_embeddings(self, task_ids):
+        return self.task_embedder(task_ids)

@@ -38,3 +38,7 @@ def sample(key, model_state, params, obs, integrator, diffusion_model, stop_grad
 
     return x_0, running_costs, stochastic_costs, terminal_costs, x_t, None
 
+def mt_sample_concat(key, model_state, params, obs, integrator, diffusion_model, task_ids, stop_grad=False,):
+    obs = jnp.concat((obs, task_ids), axis=-1)
+    return sample(key,model_state,params,obs,integrator,diffusion_model,stop_grad)
+

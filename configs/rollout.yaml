@@ -7,7 +7,7 @@ defaults:
 
 seed: 0
 use_jit: true
-tot_time_steps: 1e6
+tot_time_steps: 2000
 log_freq: 100
 step_size: ${alg.optimizer.lr_actor}
 step_size_betas: ${alg.optimizer.lr_actor}
@@ -24,7 +24,7 @@ iters: ${tot_time_steps}
 warmup_iters: 60_000
 
 # please always have same amount of envs for each task!
-env_name: ['hb/h1-stand-v0', 'hb/h1hand-run-v0']
-n_tasks: 2
+env_name: ['hb/h1-crawl-v0']
+n_tasks: 1
 task_embed: 'concat'
 task_embedding_dim: 16

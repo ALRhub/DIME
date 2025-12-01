@@ -1,9 +1,10 @@
 #@package _global_
 defaults:
   - alg: dime
-  - sampler: dis
+  - sampler: mt_dis
   - setup
   - _self_
+  - override hydra/launcher: submitit_slurm
 
 seed: 0
 use_jit: true
@@ -23,8 +24,8 @@ warmup: const
 iters: ${tot_time_steps}
 warmup_iters: 60_000
 
-# please always have same amount of envs for each task!
-env_name: ['hb/h1-stand-v0', 'hb/h1hand-run-v0']
+env_name: ['hb/h1-stand-v0', 'hb/h1-walk-v0']
 n_tasks: 2
 task_embed: 'concat'
 task_embedding_dim: 16
+task_embedding_incorporation: 'concat'

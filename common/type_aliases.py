@@ -29,3 +29,6 @@ class ReplayBufferSamplesMTNP(NamedTuple):
     dones: np.ndarray
     rewards: np.ndarray
     task_ids: np.ndarray
+
+class MTRLTrainState(RLTrainState):
+    task_embedding_incorporation: str
