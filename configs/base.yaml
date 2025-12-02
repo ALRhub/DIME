@@ -26,5 +26,4 @@ warmup_iters: 60_000
 # please always have same amount of envs for each task!
 env_name: ['hb/h1-stand-v0', 'hb/h1hand-run-v0']
 n_tasks: 2
-task_embed: 'concat'
 task_embedding_dim: 16

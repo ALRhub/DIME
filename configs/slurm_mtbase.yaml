@@ -1,13 +1,13 @@
 #@package _global_
 defaults:
-  - alg: dime
-  - sampler: mt_dis
+  - alg: mtdime_concat
+  - sampler: mtdis
   - setup
   - _self_
   - override hydra/launcher: submitit_slurm
 
 seed: 0
-use_jit: true
+use_jit: True
 tot_time_steps: 1e6
 log_freq: 100
 step_size: ${alg.optimizer.lr_actor}
@@ -26,6 +26,4 @@ warmup_iters: 60_000
 
 env_name: ['hb/h1-stand-v0', 'hb/h1-walk-v0']
 n_tasks: 2
-task_embed: 'concat'
 task_embedding_dim: 16
-task_embedding_incorporation: 'concat'

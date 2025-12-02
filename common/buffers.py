@@ -5,7 +5,7 @@ from stable_baselines3.common.buffers import DictReplayBuffer, ReplayBuffer
 from stable_baselines3.common.type_aliases import DictReplayBufferSamples, ReplayBufferSamples
 from stable_baselines3.common.vec_env import VecNormalize
 from triton.language import dtype
-from common.type_aliases import ReplayBufferSamplesMTNP
+from common.type_aliases import ReplayBufferSamplesMTNP,ReplayBufferSamplesNp
 
 ####### This class overwrites the DictReplayBuffer from stable baselines. It throws an exception when running the DMC's
 # humanoid tasks because of the head height observation. Either shimmy or dmc returns it as a 1-dim

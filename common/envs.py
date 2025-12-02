@@ -18,11 +18,15 @@ class MultitaskDummy(DummyVecEnv):
         super().__init__(env_fns)
         self.num_tasks = num_tasks
         assert not self.num_envs % self.num_tasks
+        self.task_ids = np.array(list(range(self.num_tasks))).repeat(self.num_envs/self.num_tasks)[None,:]
 
-    # def step(self, actions: np.ndarray) -> VecEnvStepReturn:
-    #     obs, rewards, dones, infos = super().step(actions)
-    #     # obs = np.concatenate((obs, self.task_ids), axis=0)
-    #     return obs, rewards, dones, infos
+    def step(self, actions: np.ndarray) -> VecEnvStepReturn:
+        obs, rewards, dones, infos = super().step(actions)
+        obs = np.concatenate((obs, self.task_ids), axis=0)
+        return obs, rewards, dones, infos
+
+    def get_task_ids(self):
+        return self.task_ids
 
 
 class FlattenObservationShadowhandWrapper(gym.ObservationWrapper):
@@ -53,6 +57,13 @@ def make_dummy_env(names, seed=0, repeat_envs=1):
     if repeat_envs > 1:
         names = sorted(names * repeat_envs) #sort to make sure the same envs are adjacent
     envs = DummyVecEnv([lambda: make_env(name, seed+i) for i,name in enumerate(names)])
+    envs.reset()
+    return envs
+
+def make_mt_dummy_env(names,n_tasks, seed=0, ):
+    set_random_seed(seed)
+    names = [names] if isinstance(names, str) else list(names)
+    envs = MultitaskDummy([lambda: make_env(name, seed + i) for i, name in enumerate(names)], num_tasks=n_tasks)
     envs.reset()
     return envs
 
@@ -133,221 +144,217 @@ def make_env(env_name: str, seed: int = 0, num_env=1) -> gym.Env:
         env = _make_env_shadowhand(task, seed, num_env)
     return env
 
-class ParallelEnv():
-    def __init__(self, env_names: list, seed: int = 0):
-        
-        np.random.seed(seed)
-        random.seed(seed)
-        
-        envs = []
-        obs_dims = np.zeros(len(env_names), dtype=np.int32)
-        act_dims = np.zeros(len(env_names), dtype=np.int32)
-        for i, env_name in enumerate(env_names):
-            envs.append(make_env(env_name, seed))
-            obs_dims[i] = envs[-1].observation_space.shape[0]
-            act_dims[i] = envs[-1].action_space.shape[0]
-
-        max_state_dim = int(np.max(obs_dims))
-        max_action_dim = int(np.max(act_dims))
-        state_dim_differences = max_state_dim - obs_dims
-
-        
-        observation_space = gym.spaces.Box(low=(np.ones(max_state_dim, dtype=np.float64)[None, :] - np.inf).repeat(len(envs), axis=0),
-                                           high=(np.ones(max_state_dim, dtype=np.float64)[None, :] + np.inf).repeat(len(envs), axis=0),
-                                           shape=(len(envs), max_state_dim),
-                                           dtype=envs[-1].observation_space.dtype)        
-                
-        action_space = gym.spaces.Box(low=(np.ones(max_action_dim, dtype=np.float64)[None, :] * -1).repeat(len(envs), axis=0),
-                                      high=(np.ones(max_action_dim, dtype=np.float64)[None, :]).repeat(len(envs), axis=0),
-                                      shape=(len(envs), max_action_dim),
-                                      dtype=envs[-1].action_space.dtype)
-    
-        
-        self.envs = envs
-        self.obs_dims = obs_dims
-        self.act_dims = act_dims
-        self.state_dim_differences = state_dim_differences
-        self.observation_space = observation_space
-        self.action_space = action_space
-        self.num_tasks = len(envs)
-        
-    def _reset_idx(self, idx: int):
-        seed = np.random.randint(0, 1e8)
-        state, _ = self.envs[idx].reset(seed=seed)
-        state = np.concatenate((state, np.zeros(self.state_dim_differences[idx], dtype=np.float32)), axis=0)
-        return state
-    
-    def generate_masks(self, terminals: np.ndarray, truncates: np.ndarray):
-        masks = 1 - (terminals * (1 - truncates))
-        return masks
-    
-    def reset_where_done(self, states: np.ndarray, terminals: np.ndarray, truncates: np.ndarray):
-        for j, (terminal, truncate) in enumerate(zip(terminals, truncates)):
-            if (terminal == True) or (truncate == True):
-                states[j], terminals[j], truncates[j] = self._reset_idx(j), False, False
-        return states, terminals, truncates
-    
-    def reset(self):
-        states = []
-        for i, env in enumerate(self.envs):
-            states.append(self._reset_idx(i))
-        return np.stack(states)
-
-    def _get_goal(self, info: dict):
-        if 'success' in info:
-            goal = info['success']
-        elif 'is_success' in info:
-            goal = info['is_success']
-        elif 'solved' in info:
-            goal = info['solved']
-        else:
-            goal = 0
-        return goal
-        
-    def step(self, actions: np.ndarray):
-        states, rewards, terminals, truncates, goals = [], [], [], [], []
-        for i, (env, action) in enumerate(zip(self.envs, actions)):
-            state, reward, terminal, truncate, info = env.step(action[:self.act_dims[i]])
-            state = np.concatenate((state, np.zeros(self.state_dim_differences[i], dtype=np.float64)), axis=0)
-            states.append(state)
-            rewards.append(reward)
-            terminals.append(terminal)
-            truncates.append(truncate)
-            goals.append(self._get_goal(info))
-        return np.stack(states), np.stack(rewards), np.stack(terminals), np.stack(truncates), np.stack(goals)   
-
-    def evaluate(self, agent, num_episodes, temperature=0.0, render=False, max_render_steps=5000, render_frameskip=4):
-        n_rollouts = np.zeros(self.num_tasks)
-        returns = np.zeros(self.num_tasks)
-        goals = np.zeros(self.num_tasks)
-        mask = np.ones(self.num_tasks)
-        mask_goals = np.ones(self.num_tasks)
-        observations = self.reset()
-        if render:
-            renders = []
-        i = 0
-        while True:
-            if render:
-                if i % render_frameskip == 0:
-                    if i < max_render_steps:
-                        env_renders = self.render()
-                        renders.append(env_renders)
-            actions = agent.sample_actions(observations, temperature=temperature)
-            #actions = envs.action_space.sample()
-            next_observations, rewards, terms, truns, success = self.step(actions)
-            returns += rewards * mask
-            goals += success * mask_goals
-            mask_goals = np.where(success, 0, mask_goals)
-            mask_goals = np.where(np.logical_or(terms, truns), 1, mask_goals)
-            observations = next_observations
-            n_rollouts += np.logical_or(terms, truns)
-            observations, terms, truns = self.reset_where_done(observations, terms, truns)
-            mask = np.where(n_rollouts >= num_episodes, 0, 1)
-            i += 1
-            if n_rollouts.min() == num_episodes:
-                break
-        if render:
-            renders = np.stack(renders)
-            renders = np.transpose(renders, (1, 0, 4, 2, 3))
-            return {'goal': goals/num_episodes, 'return': returns/num_episodes, 'renders': renders}
-        else:
-            return {'goal': goals/num_episodes, 'return': returns/num_episodes}
-
-    def render(self):
-        renders = []
-        for i, env in enumerate(self.envs):
-            render = env.render()
-            renders.append(render)
-        renders = np.stack(renders)
-        return renders
-
-
-
-
-class ParallelVecEnv(VecEnv, ParallelEnv):
-
-    def __init__(self, env_names, seed: int = 0, render_mode='rgb_array'):
-        if isinstance(env_names, str):
-            env_names = [env_names]
-        ParallelEnv.__init__(self, env_names, seed)
-        self.reward = None
-        self.dones = None
-        self.infos = None
-        self.state = None
-        self.num_envs = len(self.envs)
-        self.attrs = {'render_mode': [render_mode] * self.num_envs}
-        self.observation_space = gym.spaces.Box(
-            low=self.observation_space.low[0],
-            high=self.observation_space.high[0],
-            shape=[self.observation_space.shape[-1]],
-            dtype=self.observation_space.dtype)
-
-        self.action_space = gym.spaces.Box(
-            low=self.action_space.low[0],
-            high=self.action_space.high[0],
-            shape=[self.action_space.shape[-1]],
-            dtype=self.action_space.dtype)
-        VecEnv.__init__(self, self.num_envs,self.observation_space, self.action_space)
-
-        self.outs = None
-
-    def reset(self) -> VecEnvObs:
-        return ParallelEnv.reset(self)
-
-    def step_async(self, actions: np.ndarray) -> None:
-        states, rewards, dones, infos = [], [], [], []
-        for i, (env, action) in enumerate(zip(self.envs, actions)):
-            state, reward, terminal, truncate, info = env.step(action[:self.act_dims[i]])
-            state = np.concatenate((state, np.zeros(self.state_dim_differences[i], dtype=np.float64)), axis=0)
-            states.append(state)
-            rewards.append(reward)
-            dones.append(np.logical_or(terminal, truncate))
-            infos.append(info)
-        self.state, self.reward, self.dones, self.infos = np.stack(states), np.stack(rewards), np.stack(dones), infos
-
-
-    def step_wait(self) -> VecEnvStepReturn:
-        return self.state, self.reward, self.dones, self.infos
-
-    def get_attr(self, attr_name: str, indices: VecEnvIndices = None) -> List[Any]:
-        try:
-            if indices is None:
-                return self.attrs[attr_name]
-            elif isinstance(indices, int):
-                return [self.attrs[attr_name][indices]]
-            else:
-                return self.attrs[attr_name][indices]
-        except AttributeError :
-            print(f'Env has no {attr_name}, or indices wrong')
-
-    def set_attr(self, attr_name: str, value: Any, indices: VecEnvIndices = None) -> None:
-        if indices is None:
-            self.attrs[attr_name] = value
-        else:
-            self.attrs[attr_name][indices] = value
-
-    def env_method(self, method_name: str, *method_args, indices: VecEnvIndices = None, **method_kwargs) -> List[Any]:
-        # if indices is None:
-        #     indices = range(self.num_envs)
-        # for i in indices:
-        #     self.envs[i]
-        raise NotImplementedError
-
-    def seed(self, seed: Optional[int] = None) -> Sequence[Union[None, int]]:
-        VecEnv.seed(self, seed)
-        for i, env in enumerate(self.envs):
-            env.seed(self._seeds[i])
-
-    def _get_target_envs(self, indices: VecEnvIndices) -> List[gym.Env]:
-        indices = self._get_indices(indices)
-        return [self.envs[i] for i in indices]
-
-    def env_is_wrapped(self, wrapper_class: Type[gym.Wrapper], indices: VecEnvIndices = None) -> List[bool]:
-        target_envs = self._get_target_envs(indices)
-        # Import here to avoid a circular import
-        from stable_baselines3.common import env_util
-        return [env_util.is_wrapped(env_i, wrapper_class) for env_i in target_envs]
-
-    def close(self):
-        for env in self.envs:
-            env.close()
+# class ParallelEnv():
+#     def __init__(self, env_names: list, seed: int = 0):
+#
+#         np.random.seed(seed)
+#         random.seed(seed)
+#
+#         envs = []
+#         obs_dims = np.zeros(len(env_names), dtype=np.int32)
+#         act_dims = np.zeros(len(env_names), dtype=np.int32)
+#         for i, env_name in enumerate(env_names):
+#             envs.append(make_env(env_name, seed))
+#             obs_dims[i] = envs[-1].observation_space.shape[0]
+#             act_dims[i] = envs[-1].action_space.shape[0]
+#
+#         max_state_dim = int(np.max(obs_dims))
+#         max_action_dim = int(np.max(act_dims))
+#         state_dim_differences = max_state_dim - obs_dims
+#
+#
+#         observation_space = gym.spaces.Box(low=(np.ones(max_state_dim, dtype=np.float64)[None, :] - np.inf).repeat(len(envs), axis=0),
+#                                            high=(np.ones(max_state_dim, dtype=np.float64)[None, :] + np.inf).repeat(len(envs), axis=0),
+#                                            shape=(len(envs), max_state_dim),
+#                                            dtype=envs[-1].observation_space.dtype)
+#
+#         action_space = gym.spaces.Box(low=(np.ones(max_action_dim, dtype=np.float64)[None, :] * -1).repeat(len(envs), axis=0),
+#                                       high=(np.ones(max_action_dim, dtype=np.float64)[None, :]).repeat(len(envs), axis=0),
+#                                       shape=(len(envs), max_action_dim),
+#                                       dtype=envs[-1].action_space.dtype)
+#
+#
+#         self.envs = envs
+#         self.obs_dims = obs_dims
+#         self.act_dims = act_dims
+#         self.state_dim_differences = state_dim_differences
+#         self.observation_space = observation_space
+#         self.action_space = action_space
+#         self.num_tasks = len(envs)
+#
+#     def _reset_idx(self, idx: int):
+#         seed = np.random.randint(0, 1e8)
+#         state, _ = self.envs[idx].reset(seed=seed)
+#         state = np.concatenate((state, np.zeros(self.state_dim_differences[idx], dtype=np.float32)), axis=0)
+#         return state
+#
+#     def generate_masks(self, terminals: np.ndarray, truncates: np.ndarray):
+#         masks = 1 - (terminals * (1 - truncates))
+#         return masks
+#
+#     def reset_where_done(self, states: np.ndarray, terminals: np.ndarray, truncates: np.ndarray):
+#         for j, (terminal, truncate) in enumerate(zip(terminals, truncates)):
+#             if (terminal == True) or (truncate == True):
+#                 states[j], terminals[j], truncates[j] = self._reset_idx(j), False, False
+#         return states, terminals, truncates
+#
+#     def reset(self):
+#         states = []
+#         for i, env in enumerate(self.envs):
+#             states.append(self._reset_idx(i))
+#         return np.stack(states)
+#
+#     def _get_goal(self, info: dict):
+#         if 'success' in info:
+#             goal = info['success']
+#         elif 'is_success' in info:
+#             goal = info['is_success']
+#         elif 'solved' in info:
+#             goal = info['solved']
+#         else:
+#             goal = 0
+#         return goal
+#
+#     def step(self, actions: np.ndarray):
+#         states, rewards, terminals, truncates, goals = [], [], [], [], []
+#         for i, (env, action) in enumerate(zip(self.envs, actions)):
+#             state, reward, terminal, truncate, info = env.step(action[:self.act_dims[i]])
+#             state = np.concatenate((state, np.zeros(self.state_dim_differences[i], dtype=np.float64)), axis=0)
+#             states.append(state)
+#             rewards.append(reward)
+#             terminals.append(terminal)
+#             truncates.append(truncate)
+#             goals.append(self._get_goal(info))
+#         return np.stack(states), np.stack(rewards), np.stack(terminals), np.stack(truncates), np.stack(goals)
+#
+#     def evaluate(self, agent, num_episodes, temperature=0.0, render=False, max_render_steps=5000, render_frameskip=4):
+#         n_rollouts = np.zeros(self.num_tasks)
+#         returns = np.zeros(self.num_tasks)
+#         goals = np.zeros(self.num_tasks)
+#         mask = np.ones(self.num_tasks)
+#         mask_goals = np.ones(self.num_tasks)
+#         observations = self.reset()
+#         if render:
+#             renders = []
+#         i = 0
+#         while True:
+#             if render:
+#                 if i % render_frameskip == 0:
+#                     if i < max_render_steps:
+#                         env_renders = self.render()
+#                         renders.append(env_renders)
+#             actions = agent.sample_actions(observations, temperature=temperature)
+#             #actions = envs.action_space.sample()
+#             next_observations, rewards, terms, truns, success = self.step(actions)
+#             returns += rewards * mask
+#             goals += success * mask_goals
+#             mask_goals = np.where(success, 0, mask_goals)
+#             mask_goals = np.where(np.logical_or(terms, truns), 1, mask_goals)
+#             observations = next_observations
+#             n_rollouts += np.logical_or(terms, truns)
+#             observations, terms, truns = self.reset_where_done(observations, terms, truns)
+#             mask = np.where(n_rollouts >= num_episodes, 0, 1)
+#             i += 1
+#             if n_rollouts.min() == num_episodes:
+#                 break
+#         if render:
+#             renders = np.stack(renders)
+#             renders = np.transpose(renders, (1, 0, 4, 2, 3))
+#             return {'goal': goals/num_episodes, 'return': returns/num_episodes, 'renders': renders}
+#         else:
+#             return {'goal': goals/num_episodes, 'return': returns/num_episodes}
+#
+#     def render(self):
+#         renders = []
+#         for i, env in enumerate(self.envs):
+#             render = env.render()
+#             renders.append(render)
+#         renders = np.stack(renders)
+#         return renders
+# class ParallelVecEnv(VecEnv, ParallelEnv):
+#
+#     def __init__(self, env_names, seed: int = 0, render_mode='rgb_array'):
+#         if isinstance(env_names, str):
+#             env_names = [env_names]
+#         ParallelEnv.__init__(self, env_names, seed)
+#         self.reward = None
+#         self.dones = None
+#         self.infos = None
+#         self.state = None
+#         self.num_envs = len(self.envs)
+#         self.attrs = {'render_mode': [render_mode] * self.num_envs}
+#         self.observation_space = gym.spaces.Box(
+#             low=self.observation_space.low[0],
+#             high=self.observation_space.high[0],
+#             shape=[self.observation_space.shape[-1]],
+#             dtype=self.observation_space.dtype)
+#
+#         self.action_space = gym.spaces.Box(
+#             low=self.action_space.low[0],
+#             high=self.action_space.high[0],
+#             shape=[self.action_space.shape[-1]],
+#             dtype=self.action_space.dtype)
+#         VecEnv.__init__(self, self.num_envs,self.observation_space, self.action_space)
+#
+#         self.outs = None
+#
+#     def reset(self) -> VecEnvObs:
+#         return ParallelEnv.reset(self)
+#
+#     def step_async(self, actions: np.ndarray) -> None:
+#         states, rewards, dones, infos = [], [], [], []
+#         for i, (env, action) in enumerate(zip(self.envs, actions)):
+#             state, reward, terminal, truncate, info = env.step(action[:self.act_dims[i]])
+#             state = np.concatenate((state, np.zeros(self.state_dim_differences[i], dtype=np.float64)), axis=0)
+#             states.append(state)
+#             rewards.append(reward)
+#             dones.append(np.logical_or(terminal, truncate))
+#             infos.append(info)
+#         self.state, self.reward, self.dones, self.infos = np.stack(states), np.stack(rewards), np.stack(dones), infos
+#
+#
+#     def step_wait(self) -> VecEnvStepReturn:
+#         return self.state, self.reward, self.dones, self.infos
+#
+#     def get_attr(self, attr_name: str, indices: VecEnvIndices = None) -> List[Any]:
+#         try:
+#             if indices is None:
+#                 return self.attrs[attr_name]
+#             elif isinstance(indices, int):
+#                 return [self.attrs[attr_name][indices]]
+#             else:
+#                 return self.attrs[attr_name][indices]
+#         except AttributeError :
+#             print(f'Env has no {attr_name}, or indices wrong')
+#
+#     def set_attr(self, attr_name: str, value: Any, indices: VecEnvIndices = None) -> None:
+#         if indices is None:
+#             self.attrs[attr_name] = value
+#         else:
+#             self.attrs[attr_name][indices] = value
+#
+#     def env_method(self, method_name: str, *method_args, indices: VecEnvIndices = None, **method_kwargs) -> List[Any]:
+#         # if indices is None:
+#         #     indices = range(self.num_envs)
+#         # for i in indices:
+#         #     self.envs[i]
+#         raise NotImplementedError
+#
+#     def seed(self, seed: Optional[int] = None) -> Sequence[Union[None, int]]:
+#         VecEnv.seed(self, seed)
+#         for i, env in enumerate(self.envs):
+#             env.seed(self._seeds[i])
+#
+#     def _get_target_envs(self, indices: VecEnvIndices) -> List[gym.Env]:
+#         indices = self._get_indices(indices)
+#         return [self.envs[i] for i in indices]
+#
+#     def env_is_wrapped(self, wrapper_class: Type[gym.Wrapper], indices: VecEnvIndices = None) -> List[bool]:
+#         target_envs = self._get_target_envs(indices)
+#         # Import here to avoid a circular import
+#         from stable_baselines3.common import env_util
+#         return [env_util.is_wrapped(env_i, wrapper_class) for env_i in target_envs]
+#
+#     def close(self):
+#         for env in self.envs:
+#             env.close()

@@ -69,8 +69,9 @@ class MTDIME(DIME):
         )
         self.normalize_reward = cfg.alg.normalize_reward
         self.normalizer = RewardNormalizer(env.num_envs, self.target_entropy, discount=cfg.alg.gamma, v_max=cfg.alg.vmax) if self.normalize_reward else None
-        self.policy_cls = get_class(cfg.alg.policy_cls)
-        self.critic_cls = get_class(cfg.alg.critic._target_)
+        self.policy_cls = self.policy.__class__ #get_class(cfg.alg.policy_cls)
+        self.critic_cls = self.qf.__class__ #get_class(cfg.alg.critic.target)
+        self.task_ids = jnp.array(list(range(self.n_tasks))).repeat(int(self.env.num_envs / self.n_tasks))
 
     def train(self, batch_size, gradient_steps):
         # Sample all at once for efficiency (so we can jit the for loop)
@@ -133,8 +134,6 @@ class MTDIME(DIME):
             self.cfg.alg.critic.v_max,
             self.cfg.alg.critic.entr_coeff,
             self.cfg.alg.critic.n_atoms,
-            critic_cls=self.critic_cls,
-            policy_cls=self.policy_cls,
         )
         self._n_updates += gradient_steps
 
@@ -178,8 +177,6 @@ class MTDIME(DIME):
             v_max,
             entr_coeff,
             num_atoms,
-            critic_cls,
-            policy_cls,
     ):
         actor_loss_value = jnp.array(0)
         actor_metrics = [{}]
@@ -217,8 +214,6 @@ class MTDIME(DIME):
                 entr_coeff,
                 key,
                 target_sampler,
-                critic_cls,
-                policy_cls,
             )
             qf_state = cls.soft_update(tau, qf_state)
             target_actor_state = target_actor_state
@@ -230,13 +225,12 @@ class MTDIME(DIME):
                     qf_state,
                     ent_coef_state,
                     slice(data.observations),
+                    slice(data.task_ids),
                     n_env_interacts,
                     key,
                     z_atoms,
                     sampler,
                     q_reduce_fn,
-                    critic_cls,
-                    policy_cls,
                 )
                 ent_coef_state, _ = cls.update_temperature(target_entropy, ent_coef_state,
                                                               actor_metrics[0]['run_costs'])
@@ -312,13 +306,11 @@ class MTDIME(DIME):
             entr_coeff: float,
             key,
             sampler,
-            critic_cls=MTVectorCriticConcat,
-            policy_cls=MT_DiffPol,
     ):
         key, noise_key, dropout_key_target, dropout_key_current, redq_key = jax.random.split(key, 5)
         # sample action from the actor
-        task_embeddings = critic_cls.apply({"params":qf_state.params}, task_ids, method=policy_cls.get_task_embeddings)
-        out = policy_cls.sample_action(actor_state, actor_state.params, next_observations, noise_key, sampler, task_embeddings=task_embeddings)
+        task_embeddings = qf_state.apply_fn({'params': qf_state.params}, None, None, task_ids=task_ids, return_task_embed=True)
+        out = MT_DiffPol.sample_action(actor_state, actor_state.params, next_observations, noise_key, sampler, task_embeddings=task_embeddings)
         all_actions, next_run_costs, next_sto_costs, next_terminal_costs, latents, v_t = out
         next_state_actions = jax.lax.stop_gradient(all_actions)
         next_run_costs = jax.lax.stop_gradient(next_run_costs)
@@ -334,7 +326,7 @@ class MTDIME(DIME):
                         "params": qf_state.target_params,
                         "batch_stats": qf_state.target_batch_stats if not use_bnstats_from_live_net else batch_stats
                     },
-                    next_observations, next_state_actions, task_ids,
+                    next_observations, next_state_actions,
                     rngs={"dropout": dropout_key_target},
                     train=False, task_ids=task_ids
                 )
@@ -357,10 +349,9 @@ class MTDIME(DIME):
                     {"params": params, "batch_stats": batch_stats},
                     jnp.concatenate([observations, next_observations], axis=0),
                     jnp.concatenate([actions, next_state_actions], axis=0),
-                    task_ids,
                     rngs={"dropout": dropout_key},
                     mutable=["batch_stats"],
-                    train=True, task_ids=task_ids
+                    train=True, task_ids=np.repeat(task_ids,2, axis=0)
                 )
                 current_q_values, next_q_values = jnp.split(catted_q_values, 2, axis=1)
 
@@ -463,21 +454,18 @@ class MTDIME(DIME):
             qf_state: RLTrainState,
             ent_coef_state: TrainState,
             observations: np.ndarray,
-            task_ids,
+            task_ids: np.ndarray,
             n_env_interacts: int,
             key,
             z_atoms: jnp.ndarray,
             sampler,
             q_reduce_fn,
-            critic_cls=MTVectorCriticConcat,
-            policy_cls=MT_DiffPol
     ):
         key, dropout_key, noise_key = jax.random.split(key, 3)
 
         def actor_loss(actor_state_in, actor_params):
-            task_embeddings = critic_cls.apply({"params": qf_state.params}, task_ids,
-                                               method=MTVectorCriticConcat.get_task_embeddings)
-            out = policy_cls.sample_action(actor_state_in, actor_params, observations, noise_key, sampler, task_embeddings=task_embeddings)
+            task_embeddings = qf_state.apply_fn({'params': qf_state.params}, None, None, task_ids=task_ids, return_task_embed=True)
+            out = MT_DiffPol.sample_action(actor_state_in, actor_params, observations, noise_key, sampler, task_embeddings=task_embeddings)
             actions, run_costs, sto_costs, terminal_costs, latents, v_t = out
             qf_pi = qf_state.apply_fn(
                 {
@@ -523,3 +511,55 @@ class MTDIME(DIME):
         deterministic: bool = False,
     ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
         return self.policy.predict(observation,state, episode_start, deterministic, task_ids=task_ids)
+
+    def _sample_action(
+        self,
+        learning_starts: int,
+        action_noise: Optional[ActionNoise] = None,
+        n_envs: int = 1,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Sample an action according to the exploration policy.
+        This is either done by sampling the probability distribution of the policy,
+        or sampling a random action (from a uniform distribution over the action space)
+        or by adding noise to the deterministic output.
+
+        :param action_noise: Action noise that will be used for exploration
+            Required for deterministic policy (e.g. TD3). This can also be used
+            in addition to the stochastic policy for SAC.
+        :param learning_starts: Number of steps before learning for the warm-up phase.
+        :param n_envs:
+        :return: action to take in the environment
+            and scaled action that will be stored in the replay buffer.
+            The two differs when the action space is not normalized (bounds are not [-1, 1]).
+        """
+        # Select action randomly or according to policy
+        if self.num_timesteps < learning_starts and not (self.use_sde and self.use_sde_at_warmup):
+            # Warmup phase
+            unscaled_action = np.array([self.action_space.sample() for _ in range(n_envs)])
+        else:
+            # Note: when using continuous actions,
+            # we assume that the policy uses tanh to scale the action
+            # We use non-deterministic action in the case of SAC, for TD3, it does not matter
+            # try:
+            #     task_ids = self.replay_buffer.task_ids[self.replay_buffer.pos,:]
+            # except:
+            task_ids = self.task_ids
+            unscaled_action, _ = self.predict(self._last_obs, deterministic=False, task_ids=task_ids)
+
+        # Rescale the action from [low, high] to [-1, 1]
+        if isinstance(self.action_space, spaces.Box):
+            scaled_action = self.policy.scale_action(unscaled_action)
+
+            # Add noise to the action (improve exploration)
+            if action_noise is not None:
+                scaled_action = np.clip(scaled_action + action_noise(), -1, 1)
+
+            # We store the scaled action in the buffer
+            buffer_action = scaled_action
+            action = self.policy.unscale_action(scaled_action)
+        else:
+            # Discrete case, no need to normalize or clip
+            buffer_action = unscaled_action
+            action = buffer_action
+        return action, buffer_action

@@ -303,10 +303,13 @@ class MTVectorCriticConcat(nn.Module):
             n_atoms=self.n_atoms
         )
 
-    def __call__(self, obs: jnp.ndarray, action: jnp.ndarray, task_ids, train: bool = True):
+    def __call__(self, obs: jnp.ndarray, action: jnp.ndarray, task_ids, train: bool = True, return_task_embed= False):
         # Idea taken from https://github.com/perrin-isir/xpag
         # Similar to https://github.com/tinkoff-ai/CORL for PyTorch
         task_embeds = self.task_embedder(task_ids)
+        task_embeds = jnp.squeeze(task_embeds) if len(task_embeds.shape) == 3 else task_embeds
+        if return_task_embed:
+            return task_embeds
         obs = jnp.concat((obs,task_embeds), axis=1)
         q_values = self.vmap_critic(obs, action, train)
         return q_values

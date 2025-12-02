@@ -90,6 +90,9 @@ def get_sampler_init(alg_name):
     if alg_name == 'dis':
         from diffusion.od.dis import init_dis
         return init_dis
+    if alg_name == 'mtdis_concat':
+        from diffusion.od.dis import init_dis
+        return init_dis
 
     else:
         raise ValueError(f'No sampler named {alg_name}.')

@@ -14,7 +14,7 @@ from diffusion.common.utils import get_sampler_init
 from diffusion.od.od_integrators import get_integrator as get_integrator_od
 from diffusion.od.od_sampling import sample as sample_od
 from common.policies import BaseJaxPolicy
-from common.type_aliases import RLTrainState
+from common.type_aliases import MTRLTrainState
 from stable_baselines3.common.type_aliases import Schedule
 
 from models.utils import activation_fn
@@ -40,11 +40,11 @@ class MT_DiffPol(DiffPol):
         state: Optional[Tuple[np.ndarray, ...]] = None,
         episode_start: Optional[np.ndarray] = None,
         deterministic: bool = False,
-        task_ids=None
+        task_ids=None,
     ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
 
         assert not task_ids is None
-        task_embeddings = self.qf_state.apply_fn({'params': self.qf_state.params}, None, None, task_ids=task_ids, return_task_embed=True)
+        task_embeddings = self.qf_state.apply_fn(None, None, None, task_ids=task_ids, return_task_embed=True)
 
         observation, vectorized_env = self.prepare_obs(observation)
 
@@ -97,68 +97,74 @@ class MT_DiffPol(DiffPol):
 
         # Initialize actor
         key, diff_key = jax.random.split(key, 2)
-        # initialize Q-function
-        self.qf = get_class(self.cfg.alg.critic.target)(
-            dropout_rate=self.cfg.alg.critic.dropout_rate,
-            use_layer_norm=self.cfg.alg.critic.use_layer_norm,
-            use_batch_norm=self.cfg.alg.optimizer.bn,
-            bn_warmup=self.cfg.alg.optimizer.bn_warmup,
-            batch_norm_momentum=self.cfg.alg.optimizer.bn_momentum,
-            batch_norm_mode=self.cfg.alg.optimizer.bn_mode,
-            net_arch=self.cfg.alg.critic.hs,
-            activation_fn=activation_fn[self.cfg.alg.critic.activation],
-            n_critics=self.cfg.alg.critic.n_critics,
-            n_atoms=self.cfg.alg.critic.n_atoms,
-            n_tasks=self.cfg.n_tasks,
-            task_embed_dim=self.cfg.task_embedding_dim,
-        )
+        if self.cfg.task_embedding_incorporation == 'concat':
+            # initialize Q-function
+            self.qf = get_class(self.cfg.alg.critic.target)(
+                dropout_rate=self.cfg.alg.critic.dropout_rate,
+                use_layer_norm=self.cfg.alg.critic.use_layer_norm,
+                use_batch_norm=self.cfg.alg.optimizer.bn,
+                bn_warmup=self.cfg.alg.optimizer.bn_warmup,
+                batch_norm_momentum=self.cfg.alg.optimizer.bn_momentum,
+                batch_norm_mode=self.cfg.alg.optimizer.bn_mode,
+                net_arch=self.cfg.alg.critic.hs,
+                activation_fn=activation_fn[self.cfg.alg.critic.activation],
+                n_critics=self.cfg.alg.critic.n_critics,
+                n_atoms=self.cfg.alg.critic.n_atoms,
+                n_tasks=self.cfg.n_tasks,
+                task_embed_dim=self.cfg.task_embedding_dim,
+            )
 
-        qf_init_variables = self.qf.init(
-            {"params": qf_key, "dropout": dropout_key, "batch_stats": bn_key},
-            obs,
-            action,
-            task_ids,
-            train=False,
-        )
-        target_qf_init_variables = self.qf.init(
-            {"params": qf_key, "dropout": dropout_key, "batch_stats": bn_key},
-            obs,
-            action,
-            task_ids,
-            train=False,
-        )
+            qf_init_variables = self.qf.init(
+                {"params": qf_key, "dropout": dropout_key, "batch_stats": bn_key},
+                obs,
+                action,
+                task_ids,
+                train=False,
+            )
+            target_qf_init_variables = self.qf.init(
+                {"params": qf_key, "dropout": dropout_key, "batch_stats": bn_key},
+                obs,
+                action,
+                task_ids,
+                train=False,
+            )
 
-        self.qf_state = RLTrainState.create(
-            apply_fn=self.qf.apply,
-            params=qf_init_variables["params"],
-            batch_stats=qf_init_variables["batch_stats"],
-            target_params=target_qf_init_variables["params"],
-            target_batch_stats=target_qf_init_variables["batch_stats"],
-            tx=optax.adam(
-                learning_rate=qf_learning_rate,  # type: ignore[call-arg]
-                **dict({
-                    'b1': self.cfg.alg.optimizer.b1,
-                    'b2': 0.999  # default
-                }),
-            ),
-        )
+            self.qf_state = MTRLTrainState.create(
+                apply_fn=self.qf.apply,
+                params=qf_init_variables["params"],
+                batch_stats=qf_init_variables["batch_stats"],
+                target_params=target_qf_init_variables["params"],
+                target_batch_stats=target_qf_init_variables["batch_stats"],
+                tx=optax.adam(
+                    learning_rate=qf_learning_rate,  # type: ignore[call-arg]
+                    **dict({
+                        'b1': self.cfg.alg.optimizer.b1,
+                        'b2': 0.999  # default
+                    }),
+                ),
+                task_embedding_incorporation=self.cfg.task_embedding_incorporation,
+            )
 
-        self.qf.apply = jax.jit(  # type: ignore[method-assign]
-            self.qf.apply,
-            static_argnames=("dropout_rate", "use_layer_norm",
-                             "use_batch_norm", "batch_norm_momentum", "bn_mode"),
-        )
-        task_embedding_dim = self.cfg.task_embedding_dim
-        obs_dim = obs_dim + task_embedding_dim
-        self.actor_model, self.actor_state = get_sampler_init(self.cfg.sampler.name)(diff_key, self.cfg, a_dim, obs_dim)
-        target_model_state = get_sampler_init(self.cfg.sampler.name)(diff_key, self.cfg, a_dim, obs_dim)
-        self.actor_target_model, self.target_actor_state = target_model_state
-        self.integrator = get_integrator_od(self.cfg, self.actor_model)
-        self.target_integrator = get_integrator_od(self.cfg, self.actor_target_model)
-        sampler = get_method(self.cfg.sampler.target)
-        self.sampler = partial(sampler, integrator=self.integrator, diffusion_model=self.actor_model)
-        self.target_sampler = partial(sampler, integrator=self.target_integrator,
-                                      diffusion_model=self.actor_target_model)
+            self.qf.apply = jax.jit(  # type: ignore[method-assign]
+                self.qf.apply,
+                static_argnames=("dropout_rate", "use_layer_norm",
+                                 "use_batch_norm", "batch_norm_momentum", "bn_mode"),
+            )
+            task_embedding_dim = self.cfg.task_embedding_dim
+            a_dim = a_dim + task_embedding_dim
+            obs_dim = obs_dim + task_embedding_dim
+            self.actor_model, self.actor_state = get_sampler_init(self.cfg.sampler.name)(diff_key, self.cfg, a_dim, obs_dim)
+            target_model_state = get_sampler_init(self.cfg.sampler.name)(diff_key, self.cfg, a_dim, obs_dim)
+            self.actor_target_model, self.target_actor_state = target_model_state
+            self.integrator = get_integrator_od(self.cfg, self.actor_model)
+            self.target_integrator = get_integrator_od(self.cfg, self.actor_target_model)
+            sampler = get_method(self.cfg.sampler.target)
+            self.sampler = partial(sampler, integrator=self.integrator, diffusion_model=self.actor_model)
+            self.target_sampler = partial(sampler, integrator=self.target_integrator,
+                                          diffusion_model=self.actor_target_model)
+        else:
+            raise NotImplementedError(f'This incorporation not implemented, see MT_DiffPol')
+        self.task_embedder = TaskEmbedding(self.cfg.n_tasks, self.cfg.task_embedding_dim)
         return key
 
     @staticmethod

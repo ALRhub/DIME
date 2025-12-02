@@ -3,11 +3,11 @@ policy_tau: 1.0
 utd: 2
 gamma: 0.99
 policy_delay: 3
-batch_size: 3
-buffer_size: 10
-learning_starts: 4
+batch_size: 256
+buffer_size: 1000000
+learning_starts: 5000
 reset_models: False
-vmax: 10
+vmax: 10.0
 normalize_reward: False
 policy_cls: diffusion.MT_DiffPol.MT_DiffPol
 
@@ -17,15 +17,15 @@ ent_coef:
   target: 6.0
 
 critic:
-  _target_: models.critic.MTVectorCriticConcat
+  target: models.critic.MTVectorCriticConcat
   activation: 'relu'
   n_critics: 2
-  hs: [2, 2]
+  hs: [2048, 2048]
   dropout_rate: null # None in yaml
   use_layer_norm: False
   n_atoms: 101
-  v_min: -10
-  v_max: ${alg.vmax}
+  v_min: -200
+  v_max: 200
   entr_coeff: 0.005
 
 optimizer:

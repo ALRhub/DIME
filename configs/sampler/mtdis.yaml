@@ -1,6 +1,6 @@
 # Time-Reversed Diffusion Sampler (DIS)
-_target_: diffusion.od.od_sampling.mt_sample_concat
-name: dis
+target: diffusion.od.od_sampling.mt_sample_concat
+name: mtdis_concat
 underdamped: False
 integrator: EM
 init_std: 2.5
@@ -9,6 +9,8 @@ learn_prior: False
 learn_betas: False
 learn_friction: True
 learn_mass_matrix: False
+policy_cls: 'diffusion.MT_DiffPol.MT_DiffPol'
+critic_cls: 'models.critic.MTVectorCriticConcat'
 
 defaults:
   - score_model: cond_pisgradnet

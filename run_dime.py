@@ -111,27 +111,37 @@ def initialize_and_run(cfg):
     model.learn(total_timesteps=cfg.tot_time_steps, progress_bar=True, callback=callback_list)
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="slurm_base")
+@hydra.main(version_base=None, config_path="configs", config_name="slurm_mtbase")
 def main(cfg: DictConfig) -> None:
-    try:
-        starting_time = time.time()
-        if cfg.use_jit:
+    starting_time = time.time()
+    if cfg.use_jit:
+        initialize_and_run(cfg)
+    else:
+        with jax.disable_jit():
             initialize_and_run(cfg)
-        else:
-            with jax.disable_jit():
-                initialize_and_run(cfg)
-        end_time = time.time()
-        print(f"Training took: {(end_time - starting_time)/3600} hours")
-        if cfg.wandb["activate"]:
-            wandb.finish()
-    except Exception as ex:
-        print("-- exception occured. traceback :")
-        traceback.print_tb(ex.__traceback__)
-        print(ex, flush=True)
-        print("--------------------------------\n")
-        traceback.print_exception(ex)
-        if cfg.wandb["activate"]:
-            wandb.finish()
+    end_time = time.time()
+    print(f"Training took: {(end_time - starting_time) / 3600} hours")
+    if cfg.wandb["activate"]:
+        wandb.finish()
+    # try:
+    #     starting_time = time.time()
+    #     if cfg.use_jit:
+    #         initialize_and_run(cfg)
+    #     else:
+    #         with jax.disable_jit():
+    #             initialize_and_run(cfg)
+    #     end_time = time.time()
+    #     print(f"Training took: {(end_time - starting_time)/3600} hours")
+    #     if cfg.wandb["activate"]:
+    #         wandb.finish()
+    # except Exception as ex:
+    #     print("-- exception occured. traceback :")
+    #     traceback.print_tb(ex.__traceback__)
+    #     print(ex, flush=True)
+    #     print("--------------------------------\n")
+    #     traceback.print_exception(ex)
+    #     if cfg.wandb["activate"]:
+    #         wandb.finish()
 
 
 if __name__ == "__main__":
